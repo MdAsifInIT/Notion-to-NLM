@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+token.json
+state.json
+credentials.json
+.git/
+.gitignore
+README.md
+deploy.sh
