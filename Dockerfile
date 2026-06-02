@@ -27,4 +27,7 @@ COPY . .
 #       -v $(pwd)/state.json:/app/state.json \
 #       notion-to-gdocs
 #
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD find /tmp/healthy -mmin -200 || exit 1
+
 CMD ["python", "main.py"]
