@@ -13,16 +13,20 @@ Environment variables (see .env.example):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-from gdocs_handler import append_to_doc
+from gdocs_handler import sync_to_doc
 from notion_handler import extract_page_text, query_recent_pages
-from state_manager import load_last_processed, save_last_processed
+from state_manager import load_state, save_state
 
 # ── Bootstrap ───────────────────────────────────────────────────────────────
 
@@ -49,55 +53,154 @@ def _require_env(key: str) -> str:
 # ── Main pipeline ──────────────────────────────────────────────────────────
 
 
-def run_once() -> None:
-    # 1. Read configuration ──────────────────────────────────────────────
-    notion_token = _require_env("NOTION_TOKEN")
-    database_id = _require_env("NOTION_DATABASE_ID")
-    doc_id = _require_env("GOOGLE_DOC_ID")
-    credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
-    state_file = os.getenv("STATE_FILE", "state.json")
-    lookback_hours = int(os.getenv("DEFAULT_LOOKBACK_HOURS", "24"))
+def _write_metrics(
+    pages_synced: int = 0,
+    pages_failed: int = 0,
+    duration: float = 0.0,
+    error_msg: str | None = None,
+) -> None:
+    """
+    Atomically update file-based metrics.
+    """
+    metrics_file = os.getenv("METRICS_FILE", "metrics.json")
+    path = Path(metrics_file)
 
-    # 2. Determine the "since" timestamp ─────────────────────────────────
-    since = load_last_processed(state_file, lookback_hours)
-    run_start = datetime.now(timezone.utc)
+    data = {
+        "last_sync_timestamp": None,
+        "last_sync_duration_seconds": 0.0,
+        "last_sync_pages_synced": 0,
+        "last_sync_pages_failed": 0,
+        "total_pages_synced": 0,
+        "total_sync_runs": 0,
+        "total_errors": 0,
+        "last_error": None,
+        "last_error_timestamp": None,
+    }
 
-    # 3. Query Notion ────────────────────────────────────────────────────
-    pages = query_recent_pages(notion_token, database_id, since)
-
-    if not pages:
-        logging.getLogger("pipeline").info("No new or modified pages found. Nothing to do.")
-        # Still update the timestamp so the next run doesn't re-scan.
-        save_last_processed(state_file, run_start)
-        return
-
-    # 4. Extract text from each page ─────────────────────────────────────
-    entries: list[dict[str, str]] = []
-    for page in pages:
+    if path.exists():
         try:
-            entry = extract_page_text(notion_token, page)
-            if entry["body"].strip():
-                entries.append(entry)
-            else:
-                logging.getLogger("pipeline").debug("Page '%s' has no text content — skipping.", entry["title"])
+            data.update(json.loads(path.read_text(encoding="utf-8")))
         except Exception:
-            logging.getLogger("pipeline").exception("Failed to extract page %s — skipping.", page.get("id"))
+            pass
 
-    if not entries:
-        logging.getLogger("pipeline").info("All pages were empty or failed extraction. Nothing to append.")
-        save_last_processed(state_file, run_start)
-        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data["last_sync_timestamp"] = now_iso
+    data["last_sync_duration_seconds"] = round(duration, 3)
+    data["last_sync_pages_synced"] = pages_synced
+    data["last_sync_pages_failed"] = pages_failed
+    data["total_pages_synced"] += pages_synced
+    data["total_sync_runs"] += 1
 
-    # 5. Append to Google Doc ────────────────────────────────────────────
-    append_to_doc(credentials_file, doc_id, entries)
+    if error_msg:
+        data["total_errors"] += 1
+        data["last_error"] = error_msg
+        data["last_error_timestamp"] = now_iso
 
-    # 6. Persist state ───────────────────────────────────────────────────
-    save_last_processed(state_file, run_start)
+    path_parent = path.parent
+    path_parent.mkdir(parents=True, exist_ok=True)
 
-    logging.getLogger("pipeline").info(
-        "═══ Pipeline complete — %d entry/entries synced ═══",
-        len(entries),
-    )
+    try:
+        temp_fd, temp_path_str = tempfile.mkstemp(dir=str(path_parent), prefix=".metrics-tmp-")
+        temp_path = Path(temp_path_str)
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+            json.dump(data, temp_file, indent=2)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        logging.getLogger("pipeline").warning("Atomic replace failed for metrics (%s). Falling back to direct write.", exc)
+        if 'temp_path' in locals() and temp_path.exists():
+            temp_path.unlink()
+        try:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logging.getLogger("pipeline").warning("Failed to direct-write metrics to %s: %s", metrics_file, e)
+    except Exception as exc:
+        if 'temp_path' in locals() and temp_path.exists():
+            temp_path.unlink()
+        logging.getLogger("pipeline").warning("Failed to write metrics to %s: %s", metrics_file, exc)
+
+
+def run_once() -> None:
+    start_time = time.perf_counter()
+    pages_synced = 0
+    pages_failed = 0
+
+    try:
+        # 1. Read configuration ──────────────────────────────────────────────
+        notion_token = _require_env("NOTION_TOKEN")
+        database_id = _require_env("NOTION_DATABASE_ID")
+        doc_id = _require_env("GOOGLE_DOC_ID")
+        credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+        state_file = os.getenv("STATE_FILE", "state.json")
+        lookback_hours = int(os.getenv("DEFAULT_LOOKBACK_HOURS", "24"))
+
+        # 2. Determine the "since" timestamp ─────────────────────────────────
+        since, processed_ids = load_state(state_file, lookback_hours)
+        run_start = datetime.now(timezone.utc)
+
+        # 3. Query Notion ────────────────────────────────────────────────────
+        pages = query_recent_pages(notion_token, database_id, since)
+
+        if not pages:
+            logging.getLogger("pipeline").info("No new or modified pages found. Nothing to do.")
+            save_state(state_file, run_start, processed_ids)
+            _write_metrics(pages_synced=0, pages_failed=0, duration=time.perf_counter() - start_time)
+            # Touch healthy file (for Docker Healthcheck)
+            try:
+                Path("/tmp/healthy").touch()
+            except Exception:
+                pass
+            return
+
+        # 4. Extract text from each page ─────────────────────────────────────
+        entries: list[dict[str, Any]] = []
+        for page in pages:
+            try:
+                entry = extract_page_text(notion_token, page)
+                if entry["body"].strip():
+                    entries.append(entry)
+                else:
+                    logging.getLogger("pipeline").debug("Page '%s' has no text content — skipping.", entry["title"])
+            except Exception:
+                logging.getLogger("pipeline").exception("Failed to extract page %s — skipping.", page.get("id"))
+                pages_failed += 1
+
+        if not entries:
+            logging.getLogger("pipeline").info("All pages were empty or failed extraction. Nothing to append.")
+            save_state(state_file, run_start, processed_ids)
+            _write_metrics(pages_synced=0, pages_failed=pages_failed, duration=time.perf_counter() - start_time)
+            # Touch healthy file (for Docker Healthcheck)
+            try:
+                Path("/tmp/healthy").touch()
+            except Exception:
+                pass
+            return
+
+        # 5. Sync to Google Doc ──────────────────────────────────────────────
+        sync_to_doc(credentials_file, doc_id, entries)
+
+        # 6. Persist state ───────────────────────────────────────────────────
+        new_processed_ids = list(set(processed_ids + [e["page_id"] for e in entries]))
+        save_state(state_file, run_start, new_processed_ids)
+
+        pages_synced = len(entries)
+        duration = time.perf_counter() - start_time
+        _write_metrics(pages_synced=pages_synced, pages_failed=pages_failed, duration=duration)
+
+        logging.getLogger("pipeline").info(
+            "═══ Pipeline complete — %d entry/entries synced ═══",
+            pages_synced,
+        )
+
+        # Touch healthy file (for Docker Healthcheck)
+        try:
+            Path("/tmp/healthy").touch()
+        except Exception:
+            pass
+
+    except Exception as exc:
+        duration = time.perf_counter() - start_time
+        _write_metrics(pages_synced=0, pages_failed=0, duration=duration, error_msg=str(exc))
+        raise
 
 
 def run() -> None:
