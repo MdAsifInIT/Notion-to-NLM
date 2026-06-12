@@ -81,6 +81,16 @@ def _get_credentials(credentials_file: str) -> Credentials:
                 except KeyboardInterrupt:
                     print("\nAuthorization cancelled by user.")
                     raise
+                except EOFError as exc:
+                    raise RuntimeError(
+                        "Google OAuth re-authorization is required, but the current environment is non-interactive "
+                        "(e.g., running in Docker background daemon mode).\n"
+                        "To resolve this, please perform one of the following:\n"
+                        "1. Run the sync script locally (bare-metal) to authenticate via browser or interactive console "
+                        "and generate a fresh 'token.json'. Then copy that token.json to your Docker volume/host directory.\n"
+                        "2. Configure your Google Cloud Console OAuth consent screen status to 'In Production' so that "
+                        "your refresh token does not expire after 7 days."
+                    ) from exc
                 
                 flow.fetch_token(code=code)
                 return flow.credentials
