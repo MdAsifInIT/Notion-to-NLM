@@ -38,13 +38,25 @@ info "Installing dependencies …"
 "$PIP" install --quiet --upgrade pip
 "$PIP" install --quiet -r requirements.txt
 
-# ── 4. Ensure .env exists ──────────────────────────────────
+# ── 4. Ensure runtime configuration exists ─────────────────
 if [ ! -f ".env" ]; then
     warn ".env file not found.  Copying .env.example → .env"
     cp .env.example .env
     warn "Please edit .env with your actual credentials before running again."
     exit 0
 fi
+
+if [ ! -r ".env" ]; then
+    error ".env exists but is not readable."
+    exit 1
+fi
+
+if [ -f "credentials.json" ] && [ ! -r "credentials.json" ]; then
+    error "credentials.json exists but is not readable."
+    exit 1
+fi
+
+mkdir -p "$(dirname "${STATE_FILE:-state.json}")" "$(dirname "${METRICS_FILE:-metrics.json}")"
 
 # ── 5. Run the pipeline ────────────────────────────────────
 info "Launching pipeline …"

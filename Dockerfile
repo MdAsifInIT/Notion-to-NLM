@@ -8,14 +8,18 @@ WORKDIR /app
 
 # Prevent Python from writing .pyc files & enable unbuffered logs
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HEALTH_FILE=/tmp/healthy
 
 # ── Stage 2: install dependencies ───────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Stage 3: copy application code ─────────────────────────
-COPY . .
+RUN useradd --create-home --shell /usr/sbin/nologin appuser
+COPY --chown=appuser:appuser . .
+RUN chown appuser:appuser /app
+USER appuser
 
 # ── Entrypoint ──────────────────────────────────────────────
 # Mount your .env (or pass env vars via docker run --env-file)
@@ -28,6 +32,6 @@ COPY . .
 #       notion-to-gdocs
 #
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD find /tmp/healthy -mmin -200 || exit 1
+  CMD test -n "$(find "$HEALTH_FILE" -mmin -200 -type f 2>/dev/null)" || exit 1
 
 CMD ["python", "main.py"]

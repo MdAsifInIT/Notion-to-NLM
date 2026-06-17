@@ -1,19 +1,17 @@
 """
 notion_handler.py
 ─────────────────
-Queries a Notion database and extracts plain-text content from its pages.
+Queries a Notion database and extracts formatted plain-text content from pages.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from notion_client import Client
-from notion_client.errors import APIResponseError, HTTPResponseError
-
-from dataclasses import dataclass, asdict
+from retry_utils import RetryConfig, retry_call
 
 logger = logging.getLogger(__name__)
 
@@ -25,152 +23,246 @@ class RenderedBlock:
     annotations: list[dict[str, Any]]
     code_language: str | None = None
     checked: bool | None = None
+    depth: int = 0
+
+
+def _get_client(token: str, retry_config: RetryConfig | None = None) -> Any:
+    """Create a Notion client lazily so unit tests do not require the SDK."""
+    try:
+        from notion_client import Client
+    except ImportError as exc:
+        raise RuntimeError(
+            "notion-client is required for Notion API calls. Install requirements.txt first."
+        ) from exc
+
+    config = retry_config or RetryConfig.from_env()
+    try:
+        return Client(
+            auth=token,
+            notion_version="2022-06-28",
+            timeout_ms=int(config.timeout_seconds * 1000),
+        )
+    except TypeError:
+        return Client(auth=token, notion_version="2022-06-28")
 
 
 def _rich_text_to_plain(rich_texts: list[dict[str, Any]]) -> str:
     """Collapse a Notion rich-text array into a single plain string."""
-    return "".join(rt.get("plain_text", "") for rt in rich_texts)
+    return "".join(str(rt.get("plain_text", "")) for rt in rich_texts if isinstance(rt, dict))
 
 
 def _process_rich_text(rich_texts: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """
-    Concatenates the plain text from Notion's rich text array, and returns:
-      1. The concatenated plain text string.
-      2. A list of annotation dicts relative to the concatenated text.
+    Concatenate Notion rich text and return text plus annotation ranges relative
+    to the concatenated string.
     """
     text = ""
-    annotations = []
-    for rt in rich_texts:
-        pt = rt.get("plain_text", "")
-        if not pt:
+    annotations: list[dict[str, Any]] = []
+    for rich_text in rich_texts or []:
+        if not isinstance(rich_text, dict):
             continue
+
+        plain_text = str(rich_text.get("plain_text", ""))
+        if not plain_text:
+            continue
+
         start = len(text)
-        text += pt
+        text += plain_text
         end = len(text)
-        
-        ann = rt.get("annotations", {})
+
+        ann = rich_text.get("annotations") or {}
+        if not isinstance(ann, dict):
+            ann = {}
         has_ann = (
-            ann.get("bold") or 
-            ann.get("italic") or 
-            ann.get("underline") or 
-            ann.get("strikethrough") or 
-            ann.get("code") or 
-            (ann.get("color") and ann.get("color") != "default")
+            ann.get("bold")
+            or ann.get("italic")
+            or ann.get("underline")
+            or ann.get("strikethrough")
+            or ann.get("code")
+            or (ann.get("color") and ann.get("color") != "default")
         )
         if has_ann:
-            annotations.append({
-                "start": start,
-                "end": end,
-                "bold": ann.get("bold", False),
-                "italic": ann.get("italic", False),
-                "underline": ann.get("underline", False),
-                "strikethrough": ann.get("strikethrough", False),
-                "code": ann.get("code", False),
-                "color": ann.get("color", "default"),
-            })
+            annotations.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "bold": bool(ann.get("bold", False)),
+                    "italic": bool(ann.get("italic", False)),
+                    "underline": bool(ann.get("underline", False)),
+                    "strikethrough": bool(ann.get("strikethrough", False)),
+                    "code": bool(ann.get("code", False)),
+                    "color": ann.get("color", "default"),
+                }
+            )
     return text, annotations
 
 
-def _render_block(block: dict[str, Any]) -> RenderedBlock | None:
-    """Return a RenderedBlock for a supported block type, or *None*."""
+def _render_block(block: dict[str, Any], depth: int = 0) -> RenderedBlock | None:
+    """Return a RenderedBlock for a supported block type, or None."""
     btype = block.get("type", "")
     data = block.get(btype, {})
+    if not isinstance(data, dict):
+        logger.debug("Skipping malformed block %s: payload is not an object.", block.get("id"))
+        return None
 
-    if btype in ("paragraph", "quote", "callout", "toggle"):
+    rich_text_types = {
+        "paragraph",
+        "quote",
+        "callout",
+        "toggle",
+        "heading_1",
+        "heading_2",
+        "heading_3",
+        "bulleted_list_item",
+        "numbered_list_item",
+    }
+    if btype in rich_text_types:
         text, annotations = _process_rich_text(data.get("rich_text", []))
-        return RenderedBlock(text=text, block_type=btype, annotations=annotations)
-
-    if btype in ("heading_1", "heading_2", "heading_3"):
-        text, annotations = _process_rich_text(data.get("rich_text", []))
-        return RenderedBlock(text=text, block_type=btype, annotations=annotations)
-
-    if btype == "bulleted_list_item":
-        text, annotations = _process_rich_text(data.get("rich_text", []))
-        return RenderedBlock(text=text, block_type=btype, annotations=annotations)
-
-    if btype == "numbered_list_item":
-        text, annotations = _process_rich_text(data.get("rich_text", []))
-        return RenderedBlock(text=text, block_type=btype, annotations=annotations)
+        return RenderedBlock(text=text, block_type=btype, annotations=annotations, depth=depth)
 
     if btype == "to_do":
         text, annotations = _process_rich_text(data.get("rich_text", []))
-        checked = data.get("checked", False)
+        checked = bool(data.get("checked", False))
         prefix = "[x] " if checked else "[ ] "
         for ann in annotations:
             ann["start"] += len(prefix)
             ann["end"] += len(prefix)
-        return RenderedBlock(text=prefix + text, block_type=btype, annotations=annotations, checked=checked)
+        return RenderedBlock(
+            text=prefix + text,
+            block_type=btype,
+            annotations=annotations,
+            checked=checked,
+            depth=depth,
+        )
 
     if btype == "code":
-        lang = data.get("language", "")
+        language = data.get("language") or None
         text, annotations = _process_rich_text(data.get("rich_text", []))
-        return RenderedBlock(text=text, block_type=btype, annotations=annotations, code_language=lang)
+        return RenderedBlock(
+            text=text,
+            block_type=btype,
+            annotations=annotations,
+            code_language=language,
+            depth=depth,
+        )
 
     if btype == "divider":
-        return RenderedBlock(text="---", block_type=btype, annotations=[])
+        return RenderedBlock(text="---", block_type=btype, annotations=[], depth=depth)
 
-    # Unsupported block — skip silently.
+    if btype == "child_page":
+        title = data.get("title")
+        if title:
+            return RenderedBlock(text=str(title), block_type=btype, annotations=[], depth=depth)
+
     logger.debug("Skipping unsupported block type: %s", btype)
     return None
 
 
+def _formula_to_text(data: dict[str, Any]) -> str:
+    ftype = data.get("type")
+    if ftype in {"string", "number", "boolean"}:
+        value = data.get(ftype)
+        return "" if value is None else str(value)
+    if ftype == "date":
+        date_value = data.get("date") or {}
+        return _date_to_text(date_value) if isinstance(date_value, dict) else ""
+    return ""
+
+
+def _date_to_text(data: dict[str, Any]) -> str:
+    start = data.get("start", "")
+    end = data.get("end")
+    return f"{start} to {end}" if end else str(start)
+
+
+def _rollup_to_text(data: dict[str, Any]) -> str:
+    rtype = data.get("type")
+    if rtype == "array":
+        values: list[str] = []
+        for item in data.get("array", []):
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                item_data = item.get(item_type)
+                values.append(_property_value_to_text(item_type, item_data))
+        return ", ".join(value for value in values if value)
+    if rtype in {"number", "date"}:
+        return _property_value_to_text(rtype, data.get(rtype))
+    return ""
+
+
+def _property_value_to_text(ptype: str | None, data: Any) -> str:
+    if data is None or not ptype:
+        return ""
+
+    if ptype in {"title", "rich_text"}:
+        return _rich_text_to_plain(data if isinstance(data, list) else [])
+    if ptype == "number":
+        return str(data)
+    if ptype == "checkbox":
+        return "Yes" if data else "No"
+    if ptype in {"url", "email", "phone_number", "created_time", "last_edited_time"}:
+        return str(data)
+    if ptype in {"select", "status", "created_by", "last_edited_by"} and isinstance(data, dict):
+        return str(data.get("name", ""))
+    if ptype == "multi_select" and isinstance(data, list):
+        return ", ".join(str(item.get("name", "")) for item in data if isinstance(item, dict))
+    if ptype == "date" and isinstance(data, dict):
+        return _date_to_text(data)
+    if ptype == "people" and isinstance(data, list):
+        return ", ".join(
+            str(person.get("name", ""))
+            for person in data
+            if isinstance(person, dict) and person.get("name")
+        )
+    if ptype == "files" and isinstance(data, list):
+        names: list[str] = []
+        for file_obj in data:
+            if isinstance(file_obj, dict):
+                names.append(str(file_obj.get("name") or file_obj.get("type") or "file"))
+        return ", ".join(names)
+    if ptype == "relation" and isinstance(data, list):
+        return ", ".join(str(item.get("id", "")) for item in data if isinstance(item, dict) and item.get("id"))
+    if ptype == "formula" and isinstance(data, dict):
+        return _formula_to_text(data)
+    if ptype == "rollup" and isinstance(data, dict):
+        return _rollup_to_text(data)
+    if ptype == "unique_id" and isinstance(data, dict):
+        prefix = data.get("prefix") or ""
+        number = data.get("number")
+        return f"{prefix}-{number}" if prefix and number is not None else str(number or "")
+
+    return ""
+
+
 def _extract_properties(page: dict[str, Any]) -> list[dict[str, str]]:
-    """Extract properties of the Notion page into a list of key-value dicts."""
+    """Extract user-visible Notion properties into sorted key/value rows."""
     properties = page.get("properties", {})
-    extracted = []
-    
+    if not isinstance(properties, dict):
+        return []
+
+    extracted: list[dict[str, str]] = []
     for name, prop in properties.items():
-        ptype = prop.get("type")
-        if not ptype:
+        if not isinstance(prop, dict):
             continue
-        
+
+        ptype = prop.get("type")
         if ptype == "title":
             continue
-            
-        value_str = ""
-        data = prop.get(ptype)
-        if data is None:
-            continue
-            
-        if ptype == "rich_text":
-            value_str = "".join(rt.get("plain_text", "") for rt in data)
-        elif ptype == "number":
-            value_str = str(data)
-        elif ptype == "checkbox":
-            value_str = "Yes" if data else "No"
-        elif ptype in ("url", "email", "phone_number"):
-            value_str = str(data)
-        elif ptype == "select":
-            value_str = data.get("name", "")
-        elif ptype == "multi_select":
-            value_str = ", ".join(item.get("name", "") for item in data)
-        elif ptype == "date":
-            start = data.get("start", "")
-            end = data.get("end")
-            if end:
-                value_str = f"{start} to {end}"
-            else:
-                value_str = start
-        elif ptype == "people":
-            value_str = ", ".join(person.get("name", "") for person in data if person.get("name"))
-        elif ptype in ("created_by", "last_edited_by"):
-            value_str = data.get("name", "")
-        elif ptype in ("created_time", "last_edited_time"):
-            value_str = str(data)
-        else:
-            continue
-            
-        if value_str.strip():
-            extracted.append({
-                "name": name,
-                "value": value_str.strip()
-            })
-            
-    extracted.sort(key=lambda x: x["name"])
+
+        value = _property_value_to_text(ptype, prop.get(ptype))
+        if value.strip():
+            extracted.append({"name": str(name), "value": value.strip()})
+
+    extracted.sort(key=lambda item: item["name"].casefold())
     return extracted
 
 
-# ── Public API ──────────────────────────────────────────────────────────────
+def _format_since(since: datetime) -> str:
+    if since.tzinfo is None:
+        logger.warning("Received naive since timestamp; assuming UTC.")
+        since = since.replace(tzinfo=timezone.utc)
+    since_utc = since.astimezone(timezone.utc)
+    return since_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def query_recent_pages(
@@ -179,19 +271,13 @@ def query_recent_pages(
     since: datetime,
 ) -> list[dict[str, Any]]:
     """
-    Return Notion pages from *database_id* that were **last edited** on or
-    after *since* (a timezone-aware UTC datetime).
+    Return Notion pages from *database_id* last edited on or after *since*.
 
-    Handles pagination automatically.
-
-    Uses ``client.request()`` for compatibility with notion-client v3+,
-    where ``databases.query()`` was removed.
+    Handles pagination automatically and retries transient failures.
     """
-    client = Client(auth=token, notion_version="2022-06-28")
-
-    # Notion requires simplified ISO-8601 with trailing Z, not +00:00
-    since_utc = since.astimezone(timezone.utc)
-    since_iso = since_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    retry_config = RetryConfig.from_env()
+    client = _get_client(token, retry_config)
+    since_iso = _format_since(since)
     logger.info("Querying Notion DB %s for pages edited since %s", database_id, since_iso)
 
     body: dict[str, Any] = {
@@ -199,33 +285,34 @@ def query_recent_pages(
             "timestamp": "last_edited_time",
             "last_edited_time": {"on_or_after": since_iso},
         },
-        "sorts": [
-            {"timestamp": "last_edited_time", "direction": "ascending"},
-        ],
+        "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}],
     }
 
     pages: list[dict[str, Any]] = []
-    has_more = True
     next_cursor: str | None = None
 
-    try:
-        while has_more:
-            request_body = {**body}
-            if next_cursor:
-                request_body["start_cursor"] = next_cursor
+    while True:
+        request_body = dict(body)
+        if next_cursor:
+            request_body["start_cursor"] = next_cursor
 
-            response = client.request(
+        response = retry_call(
+            lambda: client.request(
                 path=f"databases/{database_id}/query",
                 method="POST",
                 body=request_body,
-            )
-            pages.extend(response.get("results", []))
-            has_more = response.get("has_more", False)
-            next_cursor = response.get("next_cursor")
-
-    except (APIResponseError, HTTPResponseError) as exc:
-        logger.error("Notion API error while querying database: %s", exc)
-        raise
+            ),
+            config=retry_config,
+            logger=logger,
+            operation_name="Notion database query",
+        )
+        pages.extend(response.get("results", []))
+        if not response.get("has_more", False):
+            break
+        next_cursor = response.get("next_cursor")
+        if not next_cursor:
+            logger.warning("Notion response had has_more=true but no next_cursor; stopping pagination.")
+            break
 
     logger.info("Found %d page(s) to process.", len(pages))
     return pages
@@ -234,60 +321,78 @@ def query_recent_pages(
 def _get_page_title(page: dict[str, Any]) -> str:
     """Best-effort extraction of a page title from its properties."""
     for prop in page.get("properties", {}).values():
-        if prop.get("type") == "title":
-            return _rich_text_to_plain(prop.get("title", []))
+        if isinstance(prop, dict) and prop.get("type") == "title":
+            title = _rich_text_to_plain(prop.get("title", []))
+            if title.strip():
+                return title.strip()
     return "Untitled"
+
+
+def _iter_child_blocks(
+    client: Any,
+    block_id: str,
+    retry_config: RetryConfig,
+    *,
+    depth: int = 0,
+) -> list[RenderedBlock]:
+    blocks: list[RenderedBlock] = []
+    next_cursor: str | None = None
+
+    while True:
+        kwargs: dict[str, Any] = {"block_id": block_id}
+        if next_cursor:
+            kwargs["start_cursor"] = next_cursor
+
+        response = retry_call(
+            lambda: client.blocks.children.list(**kwargs),
+            config=retry_config,
+            logger=logger,
+            operation_name="Notion block children list",
+        )
+
+        for block in response.get("results", []):
+            if not isinstance(block, dict):
+                continue
+            rendered = _render_block(block, depth=depth)
+            if rendered is not None:
+                blocks.append(rendered)
+            if block.get("has_children") and block.get("id"):
+                blocks.extend(
+                    _iter_child_blocks(
+                        client,
+                        str(block["id"]),
+                        retry_config,
+                        depth=depth + 1,
+                    )
+                )
+
+        if not response.get("has_more", False):
+            break
+        next_cursor = response.get("next_cursor")
+        if not next_cursor:
+            logger.warning("Notion block response had has_more=true but no next_cursor.")
+            break
+
+    return blocks
 
 
 def extract_page_text(token: str, page: dict[str, Any]) -> dict[str, Any]:
     """
-    Download all supported blocks for a single page and return::
-
-        {
-            "title": "...",
-            "body": "...",
-            "last_edited": "...",
-            "blocks": [...],
-            "properties": [...],
-            "page_id": "..."
-        }
+    Download all supported blocks for a single page and return the sync entry.
     """
-    client = Client(auth=token, notion_version="2022-06-28")
+    retry_config = RetryConfig.from_env()
+    client = _get_client(token, retry_config)
     page_id = page["id"]
     title = _get_page_title(page)
     last_edited = page.get("last_edited_time", "")
 
     logger.debug("Extracting blocks from page '%s' (%s)", title, page_id)
-
-    blocks: list[RenderedBlock] = []
-    has_more = True
-    next_cursor: str | None = None
-
-    try:
-        while has_more:
-            kwargs: dict[str, Any] = {}
-            if next_cursor:
-                kwargs["start_cursor"] = next_cursor
-
-            response = client.blocks.children.list(block_id=page_id, **kwargs)
-
-            for block in response.get("results", []):
-                rendered = _render_block(block)
-                if rendered is not None:
-                    blocks.append(rendered)
-
-            has_more = response.get("has_more", False)
-            next_cursor = response.get("next_cursor")
-
-    except (APIResponseError, HTTPResponseError) as exc:
-        logger.error("Notion API error reading blocks for page %s: %s", page_id, exc)
-        raise
-
+    blocks = _iter_child_blocks(client, page_id, retry_config)
     properties = _extract_properties(page)
 
     return {
         "title": title,
-        "body": "\n".join(b.text for b in blocks),
+        "body": "\n".join(block.text for block in blocks),
         "last_edited": last_edited,
         "blocks": blocks,
         "properties": properties,

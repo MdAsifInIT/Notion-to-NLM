@@ -4,6 +4,9 @@ __pycache__/
 .env
 token.json
 state.json
+metrics.json
+*.lock
+*.corrupt-*
 credentials.json
 .git/
 .gitignore
